@@ -67,12 +67,12 @@ enum YouTubeService {
         let audio = streams.filterAudioOnly().filter { $0.isNativelyPlayable }
         if let stream = audio.filter({ $0.fileExtension == .m4a }).highestAudioBitrateStream()
             ?? audio.highestAudioBitrateStream() {
-            try await stream.waitUntilAvailable()
+            
             return stream.url
         }
         // Último recurso: vídeo+audio (más datos, pero suena igual)
         if let stream = streams.filterVideoAndAudio().filter({ $0.isNativelyPlayable }).first {
-            try await stream.waitUntilAvailable()
+            
             return stream.url
         }
         throw YouTubeError.noPlayableStream
