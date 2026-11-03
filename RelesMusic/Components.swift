@@ -62,6 +62,7 @@ struct TrackRow: View {
             }
             .foregroundStyle(.secondary)
         }
+        .onAppear { player.prepare(track) }
         .sheet(isPresented: $showAddToPlaylist) {
             AddToPlaylistSheet(track: track)
         }

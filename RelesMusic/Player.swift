@@ -22,14 +22,23 @@ final class Player: ObservableObject {
     private let player = AVPlayer()
     private var originalQueue: [Track] = []
     private var urlCache: [String: (url: URL, date: Date)] = [:]
+    private var inflight: [String: Task<URL, Error>] = [:]
+    private var prefetchQueue: [String] = []
+    private var activePrefetches = 0
+    private static let maxPrefetches = 3
     private var artwork: MPMediaItemArtwork?
     private var loadTask: Task<Void, Never>?
     private var timeObserver: Any?
+    private var statusObservation: NSKeyValueObservation?
     private var failuresInARow = 0
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
+    private static let cacheKey = "urlCache"
+    private static let cacheLifetime: TimeInterval = 3 * 3600 // los enlaces de YouTube caducan a las ~6 h
+
     init() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        loadCache()
 
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main
@@ -163,8 +172,9 @@ final class Player: ObservableObject {
 
     // MARK: Carga
 
-    private func load() {
+    private func load(fresh: Bool = false) {
         guard let track = current else { return }
+        if fresh { urlCache[track.id] = nil }
         loadTask?.cancel()
         player.pause()
         player.replaceCurrentItem(with: nil)
@@ -181,10 +191,16 @@ final class Player: ObservableObject {
 
         loadTask = Task {
             do {
-                let url = try await resolve(track.id)
+                // Si el primer intento falló al reproducir, el reintento usa la vía lenta y fiable
+                let url = try await resolve(track.id, allowFastPath: !fresh)
                 guard !Task.isCancelled, current?.id == track.id else { return }
                 try? AVAudioSession.sharedInstance().setActive(true)
-                player.replaceCurrentItem(with: AVPlayerItem(url: url))
+                let item = AVPlayerItem(url: url)
+                if YouTubeService.isHLS(url) {
+                    item.preferredPeakBitRate = 900_000 // calidad de audio buena sin gastar datos en vídeo HD
+                }
+                watchForFailure(item, track: track, retried: fresh)
+                player.replaceCurrentItem(with: item)
                 player.play()
                 isPlaying = true
                 isLoading = false
@@ -221,20 +237,87 @@ final class Player: ObservableObject {
         backgroundTask = .invalid
     }
 
-    private func resolve(_ id: String) async throws -> URL {
-        // Los enlaces de YouTube caducan a las ~6 h
-        if let cached = urlCache[id], Date().timeIntervalSince(cached.date) < 3 * 3600 {
-            return cached.url
+    private func resolve(_ id: String, allowFastPath: Bool = true) async throws -> URL {
+        if allowFastPath {
+            if isCached(id), let cached = urlCache[id] { return cached.url }
+            // Si ya se está preparando (precarga), espera a esa misma búsqueda
+            if let task = inflight[id] { return try await task.value }
         }
-        let url = try await YouTubeService.audioURL(for: id)
+        let task = Task { try await YouTubeService.audioURL(for: id, allowFastPath: allowFastPath) }
+        if allowFastPath { inflight[id] = task }
+        defer { if allowFastPath { inflight[id] = nil } }
+        let url = try await task.value
         urlCache[id] = (url: url, date: Date())
+        saveCache()
         return url
     }
 
+    /// Prepara una canción que está en pantalla para que suene al instante al tocarla.
+    /// Se atienden primero las últimas que han aparecido (las que estás viendo ahora).
+    func prepare(_ track: Track) {
+        let id = track.id
+        guard !isCached(id), inflight[id] == nil, !prefetchQueue.contains(id) else { return }
+        prefetchQueue.append(id)
+        if prefetchQueue.count > 30 { prefetchQueue.removeFirst() }
+        runPrefetches()
+    }
+
+    func prefetch(_ tracks: [Track], limit: Int = 3) {
+        for track in tracks.prefix(limit).reversed() { prepare(track) }
+    }
+
+    private func runPrefetches() {
+        while activePrefetches < Self.maxPrefetches, let id = prefetchQueue.popLast() {
+            activePrefetches += 1
+            Task {
+                _ = try? await resolve(id)
+                activePrefetches -= 1
+                runPrefetches()
+            }
+        }
+    }
+
+    private func isCached(_ id: String) -> Bool {
+        guard let cached = urlCache[id] else { return false }
+        return Date().timeIntervalSince(cached.date) < Self.cacheLifetime
+    }
+
     private func prefetchNext() {
-        guard index + 1 < queue.count else { return }
-        let id = queue[index + 1].id
-        Task { _ = try? await resolve(id) }
+        prefetch(Array(queue.dropFirst(index + 1)), limit: 2)
+    }
+
+    /// Si el enlace guardado ya no vale (caducado o cambiaste de wifi a datos), pide uno nuevo una vez.
+    private func watchForFailure(_ item: AVPlayerItem, track: Track, retried: Bool) {
+        statusObservation = item.observe(\.status) { [weak self] item, _ in
+            guard item.status == .failed else { return }
+            Task { @MainActor in
+                guard let self, self.current?.id == track.id else { return }
+                if retried {
+                    self.isPlaying = false
+                    self.errorMessage = "No se pudo reproducir «\(track.title)»"
+                    self.updateNowPlaying()
+                } else {
+                    self.load(fresh: true)
+                }
+            }
+        }
+    }
+
+    private func loadCache() {
+        guard let raw = UserDefaults.standard.dictionary(forKey: Self.cacheKey) else { return }
+        for (id, value) in raw {
+            guard let entry = value as? [String: Any],
+                  let string = entry["url"] as? String, let url = URL(string: string),
+                  let date = entry["date"] as? Date,
+                  Date().timeIntervalSince(date) < Self.cacheLifetime else { continue }
+            urlCache[id] = (url: url, date: date)
+        }
+    }
+
+    private func saveCache() {
+        let fresh = urlCache.filter { Date().timeIntervalSince($0.value.date) < Self.cacheLifetime }
+        let raw = fresh.mapValues { ["url": $0.url.absoluteString, "date": $0.date] as [String: Any] }
+        UserDefaults.standard.set(raw, forKey: Self.cacheKey)
     }
 
     private func trackEnded() {
