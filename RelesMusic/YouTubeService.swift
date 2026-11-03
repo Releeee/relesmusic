@@ -62,9 +62,7 @@ enum YouTubeService {
 
     // MARK: Audio
 
-    /// Primero prueba la vía rápida (una sola petición); si falla, usa YouTubeKit (más lento pero más fiable).
-    static func audioURL(for videoID: String, allowFastPath: Bool = true) async throws -> URL {
-        if allowFastPath, let url = try? await fastAudioURL(for: videoID) { return url }
+    static func audioURL(for videoID: String) async throws -> URL {
         let streams = try await YouTube(videoID: videoID, methods: [.local, .remote]).streams
         let audio = streams.filterAudioOnly().filter { $0.isNativelyPlayable }
         if let stream = audio.filter({ $0.fileExtension == .m4a }).highestAudioBitrateStream()
@@ -76,68 +74,6 @@ enum YouTubeService {
             return stream.url
         }
         throw YouTubeError.noPlayableStream
-    }
-
-    // MARK: Vía rápida (API de la app oficial de YouTube para iPhone)
-
-    private static let iosClientVersion = "20.10.4"
-
-    private static func fastAudioURL(for videoID: String) async throws -> URL {
-        var request = URLRequest(url: URL(string: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")!)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 6
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("com.google.ios.youtube/\(iosClientVersion) (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-                         forHTTPHeaderField: "User-Agent")
-        request.setValue("5", forHTTPHeaderField: "X-Youtube-Client-Name")
-        request.setValue(iosClientVersion, forHTTPHeaderField: "X-Youtube-Client-Version")
-        let body: [String: Any] = [
-            "context": ["client": [
-                "clientName": "IOS", "clientVersion": iosClientVersion,
-                "deviceMake": "Apple", "deviceModel": "iPhone16,2",
-                "osName": "iPhone", "osVersion": "18.3.2.22D82",
-                "hl": "es", "gl": "ES"
-            ]],
-            "videoId": videoID,
-            "contentCheckOk": true,
-            "racyCheckOk": true
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              (json["playabilityStatus"] as? [String: Any])?["status"] as? String == "OK",
-              let streaming = json["streamingData"] as? [String: Any] else {
-            throw YouTubeError.noPlayableStream
-        }
-
-        // 1º: solo audio m4a (gasta menos datos), comprobando que YouTube deja descargarlo
-        let formats = streaming["adaptiveFormats"] as? [[String: Any]] ?? []
-        let audio = formats
-            .filter { ($0["mimeType"] as? String)?.hasPrefix("audio/mp4") == true }
-            .sorted { ($0["bitrate"] as? Int ?? 0) > ($1["bitrate"] as? Int ?? 0) }
-        if let string = audio.first?["url"] as? String, let url = URL(string: string), await isReachable(url) {
-            return url
-        }
-
-        // 2º: lista HLS, que AVPlayer reproduce directamente
-        if let string = streaming["hlsManifestUrl"] as? String, let url = URL(string: string) {
-            return url
-        }
-        throw YouTubeError.noPlayableStream
-    }
-
-    private static func isReachable(_ url: URL) async -> Bool {
-        var request = URLRequest(url: url)
-        request.setValue("bytes=0-1", forHTTPHeaderField: "Range")
-        request.timeoutInterval = 4
-        let result = try? await URLSession.shared.data(for: request)
-        guard let http = result?.1 as? HTTPURLResponse else { return false }
-        return (200..<300).contains(http.statusCode)
-    }
-
-    static func isHLS(_ url: URL) -> Bool {
-        url.host?.contains("manifest.googlevideo.com") == true || url.pathExtension == "m3u8"
     }
 
     // MARK: Enlaces

@@ -25,9 +25,12 @@ final class Player: ObservableObject {
     private var originalQueue: [Track] = []
     private var urlCache: [String: (url: URL, date: Date)] = [:]
     private var inflight: [String: Task<URL, Error>] = [:]
-    private var prefetchQueue: [String] = []
+    private var visibleQueue: [String] = []   // canciones en pantalla (la última vista va primero)
+    private var upcomingQueue: [String] = []  // próximas de la cola, en orden
+    private var preparing = Set<String>()
     private var activePrefetches = 0
     private static let maxPrefetches = 3
+    private static let upcomingCount = 15     // no más, para no gastar datos de golpe
     private var artwork: MPMediaItemArtwork?
     private var loadTask: Task<Void, Never>?
     private var timeObserver: Any?
@@ -105,12 +108,14 @@ final class Player: ObservableObject {
         guard current != nil else { play([track]); return }
         queue.insert(track, at: index + 1)
         originalQueue.append(track)
+        prepareUpcoming()
     }
 
     func addToQueue(_ track: Track) {
         guard current != nil else { play([track]); return }
         queue.append(track)
         originalQueue.append(track)
+        prepareUpcoming()
     }
 
     func toggleShuffle() {
@@ -125,6 +130,7 @@ final class Player: ObservableObject {
             queue = originalQueue
             index = originalQueue.firstIndex(of: cur) ?? 0
         }
+        prepareUpcoming()
     }
 
     func cycleRepeat() {
@@ -206,15 +212,11 @@ final class Player: ObservableObject {
 
         loadTask = Task {
             do {
-                // Si el primer intento falló al reproducir, el reintento usa la vía lenta y fiable
-                let url = try await resolve(track.id, allowFastPath: !fresh)
+                let url = try await resolve(track.id)
                 guard !Task.isCancelled, current?.id == track.id else { return }
                 linkSeconds = Date().timeIntervalSince(started)
                 try? AVAudioSession.sharedInstance().setActive(true)
                 let item = AVPlayerItem(url: url)
-                if YouTubeService.isHLS(url) {
-                    item.preferredPeakBitRate = 900_000 // calidad de audio buena sin gastar datos en vídeo HD
-                }
                 watchForFailure(item, track: track, retried: fresh)
                 player.replaceCurrentItem(with: item)
                 player.play()
@@ -222,7 +224,7 @@ final class Player: ObservableObject {
                 isLoading = false
                 failuresInARow = 0
                 updateNowPlaying()
-                prefetchNext()
+                prepareUpcoming()
                 endBackgroundWork()
             } catch {
                 guard !Task.isCancelled, current?.id == track.id else { return }
@@ -240,15 +242,12 @@ final class Player: ObservableObject {
         }
     }
 
-    /// Apunta cuánto tardó: conseguir el enlace (y por qué vía) y empezar a sonar.
+    /// Apunta cuánto tardó en conseguir el enlace y en empezar a sonar.
     private func markStartedPlaying() {
-        guard let started = loadStarted, let item = player.currentItem,
-              let url = (item.asset as? AVURLAsset)?.url else { return }
+        guard let started = loadStarted, player.currentItem != nil else { return }
         loadStarted = nil
         let total = Date().timeIntervalSince(started)
-        let fast = YouTubeService.isHLS(url) || url.absoluteString.contains("c=IOS")
-        loadInfo = String(format: "Enlace: %.1f s (%@) · Sonando a los %.1f s",
-                          linkSeconds, fast ? "vía rápida" : "vía lenta", total)
+        loadInfo = String(format: "Enlace: %.1f s · Sonando a los %.1f s", linkSeconds, total)
     }
 
     private func beginBackgroundWork() {
@@ -264,15 +263,13 @@ final class Player: ObservableObject {
         backgroundTask = .invalid
     }
 
-    private func resolve(_ id: String, allowFastPath: Bool = true) async throws -> URL {
-        if allowFastPath {
-            if isCached(id), let cached = urlCache[id] { return cached.url }
-            // Si ya se está preparando (precarga), espera a esa misma búsqueda
-            if let task = inflight[id] { return try await task.value }
-        }
-        let task = Task { try await YouTubeService.audioURL(for: id, allowFastPath: allowFastPath) }
-        if allowFastPath { inflight[id] = task }
-        defer { if allowFastPath { inflight[id] = nil } }
+    private func resolve(_ id: String) async throws -> URL {
+        if isCached(id), let cached = urlCache[id] { return cached.url }
+        // Si ya se está preparando (precarga), espera a esa misma búsqueda
+        if let task = inflight[id] { return try await task.value }
+        let task = Task { try await YouTubeService.audioURL(for: id) }
+        inflight[id] = task
+        defer { inflight[id] = nil }
         let url = try await task.value
         urlCache[id] = (url: url, date: Date())
         saveCache()
@@ -283,9 +280,9 @@ final class Player: ObservableObject {
     /// Se atienden primero las últimas que han aparecido (las que estás viendo ahora).
     func prepare(_ track: Track) {
         let id = track.id
-        guard !isCached(id), inflight[id] == nil, !prefetchQueue.contains(id) else { return }
-        prefetchQueue.append(id)
-        if prefetchQueue.count > 30 { prefetchQueue.removeFirst() }
+        guard needsPreparing(id), !visibleQueue.contains(id) else { return }
+        visibleQueue.append(id)
+        if visibleQueue.count > 30 { visibleQueue.removeFirst() }
         runPrefetches()
     }
 
@@ -293,24 +290,51 @@ final class Player: ObservableObject {
         for track in tracks.prefix(limit).reversed() { prepare(track) }
     }
 
+    /// Prepara en orden las próximas canciones de la cola (y la anterior), para que
+    /// siguiente/anterior suenen al momento. Se rellena cada vez que cambia de canción.
+    private func prepareUpcoming() {
+        guard !queue.isEmpty else { return }
+        var ids = queue[(index + 1)...].prefix(Self.upcomingCount).map(\.id)
+        if repeatMode == .all, ids.count < Self.upcomingCount {
+            ids += queue.prefix(min(index, Self.upcomingCount - ids.count)).map(\.id)
+        }
+        if index > 0 { ids.append(queue[index - 1].id) }
+        upcomingQueue = ids.filter { needsPreparing($0) }
+        runPrefetches()
+    }
+
     private func runPrefetches() {
-        while activePrefetches < Self.maxPrefetches, let id = prefetchQueue.popLast() {
+        while activePrefetches < Self.maxPrefetches, let id = nextToPrepare() {
             activePrefetches += 1
+            preparing.insert(id)
             Task {
                 _ = try? await resolve(id)
+                preparing.remove(id)
                 activePrefetches -= 1
                 runPrefetches()
             }
         }
     }
 
+    /// Primero lo que estás viendo en pantalla; después, lo que viene en la cola.
+    private func nextToPrepare() -> String? {
+        while let id = visibleQueue.popLast() {
+            if needsPreparing(id) { return id }
+        }
+        while !upcomingQueue.isEmpty {
+            let id = upcomingQueue.removeFirst()
+            if needsPreparing(id) { return id }
+        }
+        return nil
+    }
+
+    private func needsPreparing(_ id: String) -> Bool {
+        !isCached(id) && inflight[id] == nil && !preparing.contains(id)
+    }
+
     private func isCached(_ id: String) -> Bool {
         guard let cached = urlCache[id] else { return false }
         return Date().timeIntervalSince(cached.date) < Self.cacheLifetime
-    }
-
-    private func prefetchNext() {
-        prefetch(Array(queue.dropFirst(index + 1)), limit: 2)
     }
 
     /// Si el enlace guardado ya no vale (caducado o cambiaste de wifi a datos), pide uno nuevo una vez.
