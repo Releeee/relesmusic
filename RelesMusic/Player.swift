@@ -16,6 +16,8 @@ final class Player: ObservableObject {
     @Published private(set) var shuffle = false
     @Published var repeatMode: RepeatMode = .off
     @Published var errorMessage: String?
+    /// Diagnóstico de velocidad de la última canción (se muestra en la pantalla del reproductor).
+    @Published private(set) var loadInfo: String?
 
     var current: Track? { queue.indices.contains(index) ? queue[index] : nil }
 
@@ -30,6 +32,9 @@ final class Player: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var timeObserver: Any?
     private var statusObservation: NSKeyValueObservation?
+    private var playbackObservation: NSKeyValueObservation?
+    private var loadStarted: Date?
+    private var linkSeconds: Double = 0
     private var failuresInARow = 0
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
@@ -39,6 +44,13 @@ final class Player: ObservableObject {
     init() {
         try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
         loadCache()
+        // Empieza a sonar en cuanto hay algo de audio, sin esperar a llenar mucho búfer
+        player.automaticallyWaitsToMinimizeStalling = false
+
+        playbackObservation = player.observe(\.timeControlStatus) { [weak self] player, _ in
+            guard player.timeControlStatus == .playing else { return }
+            Task { @MainActor in self?.markStartedPlaying() }
+        }
 
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 600), queue: .main
@@ -183,6 +195,9 @@ final class Player: ObservableObject {
         duration = 0
         errorMessage = nil
         artwork = nil
+        loadInfo = nil
+        let started = Date()
+        loadStarted = started
         updateNowPlaying()
         loadArtwork(for: track)
 
@@ -194,6 +209,7 @@ final class Player: ObservableObject {
                 // Si el primer intento falló al reproducir, el reintento usa la vía lenta y fiable
                 let url = try await resolve(track.id, allowFastPath: !fresh)
                 guard !Task.isCancelled, current?.id == track.id else { return }
+                linkSeconds = Date().timeIntervalSince(started)
                 try? AVAudioSession.sharedInstance().setActive(true)
                 let item = AVPlayerItem(url: url)
                 if YouTubeService.isHLS(url) {
@@ -222,6 +238,17 @@ final class Player: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Apunta cuánto tardó: conseguir el enlace (y por qué vía) y empezar a sonar.
+    private func markStartedPlaying() {
+        guard let started = loadStarted, let item = player.currentItem,
+              let url = (item.asset as? AVURLAsset)?.url else { return }
+        loadStarted = nil
+        let total = Date().timeIntervalSince(started)
+        let fast = YouTubeService.isHLS(url) || url.absoluteString.contains("c=IOS")
+        loadInfo = String(format: "Enlace: %.1f s (%@) · Sonando a los %.1f s",
+                          linkSeconds, fast ? "vía rápida" : "vía lenta", total)
     }
 
     private func beginBackgroundWork() {

@@ -77,6 +77,9 @@ struct NowPlayingView: View {
                     if let error = player.errorMessage {
                         Text(error).font(.caption).foregroundStyle(.red)
                     }
+                    if let info = player.loadInfo {
+                        Text(info).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                    }
                 }
                 Spacer(minLength: 0)
             }
