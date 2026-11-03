@@ -33,6 +33,8 @@ final class Player: ObservableObject {
     private var loadStarted: Date?
     private var linkSeconds: Double = 0
     private var failuresInARow = 0
+    private var realDuration: Double?   // la duración de verdad; la que calcula AVPlayer a veces sale inflada
+    private var endHandled = false
     private var backgroundTask: UIBackgroundTaskIdentifier = .invalid
 
     private static let cacheKey = "urlCache"
@@ -176,6 +178,7 @@ final class Player: ObservableObject {
     func seek(to seconds: Double) {
         player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600))
         currentTime = seconds
+        if let real = realDuration, seconds < real - 1 { endHandled = false }
         updateNowPlaying()
     }
 
@@ -190,6 +193,7 @@ final class Player: ObservableObject {
         isLoading = true
         currentTime = 0
         duration = 0
+        realDuration = nil
         errorMessage = nil
         artwork = nil
         loadInfo = nil
@@ -208,6 +212,9 @@ final class Player: ObservableObject {
                 linkSeconds = Date().timeIntervalSince(started)
                 try? AVAudioSession.sharedInstance().setActive(true)
                 let item = AVPlayerItem(url: url)
+                realDuration = Self.realDuration(of: url, track: track)
+                endHandled = false
+                if let realDuration { duration = realDuration }
                 watchForFailure(item, track: track, retried: fresh)
                 player.replaceCurrentItem(with: item)
                 player.play()
@@ -315,8 +322,11 @@ final class Player: ObservableObject {
     }
 
     private func trackEnded() {
+        guard !endHandled else { return }
+        endHandled = true
         if repeatMode == .one {
             seek(to: 0)
+            endHandled = false
             player.play()
         } else {
             next()
@@ -325,10 +335,32 @@ final class Player: ObservableObject {
 
     private func tick(_ time: CMTime) {
         currentTime = time.seconds.isFinite ? time.seconds : 0
-        if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0, d != duration {
+        if let real = realDuration {
+            // Se pasa a la siguiente al llegar a la duración real, sin esperar al silencio del final
+            if currentTime >= real - 0.3, player.currentItem != nil, !isLoading {
+                trackEnded()
+            }
+        } else if let d = player.currentItem?.duration.seconds, d.isFinite, d > 0, d != duration {
             duration = d
             updateNowPlaying()
         }
+    }
+
+    /// YouTube indica la duración exacta en el propio enlace (`dur=`); si no, se usa la de la búsqueda.
+    private static func realDuration(of url: URL, track: Track) -> Double? {
+        if let value = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?.first(where: { $0.name == "dur" })?.value,
+           let seconds = Double(value), seconds > 0 {
+            return seconds
+        }
+        guard let text = track.duration else { return nil }
+        var seconds = 0.0
+        for (i, part) in text.split(separator: ":").reversed().enumerated() {
+            guard let n = Double(part) else { return nil }
+            seconds += n * pow(60, Double(i))
+        }
+        // La de la búsqueda va redondeada a segundos: +1 para no cortar el final
+        return seconds > 0 ? seconds + 1 : nil
     }
 
     private func handleInterruption(_ type: AVAudioSession.InterruptionType, shouldResume: Bool) {
