@@ -1,0 +1,37 @@
+name: RelesMusic
+options:
+  bundleIdPrefix: com.rele
+  deploymentTarget:
+    iOS: "16.0"
+
+packages:
+  YouTubeKit:
+    url: https://github.com/alexeichhorn/YouTubeKit
+    from: 0.4.10
+
+targets:
+  RelesMusic:
+    type: application
+    platform: iOS
+    sources: [RelesMusic]
+    dependencies:
+      - package: YouTubeKit
+    scheme: {}
+    info:
+      path: RelesMusic/Info.plist
+      properties:
+        CFBundleDisplayName: "Rele's Music"
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIBackgroundModes: [audio]
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+        NSAppleMusicUsageDescription: "Para importar tus playlists de Apple Music."
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.rele.relesmusic
+        PRODUCT_NAME: RelesMusic
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        TARGETED_DEVICE_FAMILY: "1"
+        SWIFT_VERSION: "5.0"
