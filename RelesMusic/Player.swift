@@ -29,7 +29,7 @@ final class Player: ObservableObject {
     private var upcomingQueue: [String] = []  // próximas de la cola, en orden
     private var preparing = Set<String>()
     private var activePrefetches = 0
-    private static let maxPrefetches = 3
+    private static let maxPrefetches = 1      // de una en una, para no frenar la canción que pulsas
     private static let upcomingCount = 15     // no más, para no gastar datos de golpe
     private var artwork: MPMediaItemArtwork?
     private var loadTask: Task<Void, Never>?
@@ -230,6 +230,7 @@ final class Player: ObservableObject {
                 guard !Task.isCancelled, current?.id == track.id else { return }
                 endBackgroundWork()
                 isLoading = false
+                runPrefetches()
                 errorMessage = "No se pudo reproducir «\(track.title)»"
                 failuresInARow += 1
                 if failuresInARow < 5, index + 1 < queue.count {
@@ -304,7 +305,8 @@ final class Player: ObservableObject {
     }
 
     private func runPrefetches() {
-        while activePrefetches < Self.maxPrefetches, let id = nextToPrepare() {
+        // Mientras carga la canción que has pulsado, no se empieza a preparar ninguna otra
+        while !isLoading, activePrefetches < Self.maxPrefetches, let id = nextToPrepare() {
             activePrefetches += 1
             preparing.insert(id)
             Task {
