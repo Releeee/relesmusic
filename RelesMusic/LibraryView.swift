@@ -105,7 +105,6 @@ struct PlaylistView: View {
                 .onMove { library.move(from: $0, to: $1, in: playlistID) }
             }
             .listStyle(.plain)
-            .onAppear { player.prefetch(playlist.tracks) }
             .navigationTitle(playlist.name)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -146,7 +145,6 @@ struct AllTracksView: View {
             }
         }
         .listStyle(.plain)
-        .onAppear { player.prefetch(tracks) }
         .navigationTitle("Todas las canciones")
     }
 }

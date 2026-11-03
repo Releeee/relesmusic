@@ -25,12 +25,6 @@ final class Player: ObservableObject {
     private var originalQueue: [Track] = []
     private var urlCache: [String: (url: URL, date: Date)] = [:]
     private var inflight: [String: Task<URL, Error>] = [:]
-    private var visibleQueue: [String] = []   // canciones en pantalla (la última vista va primero)
-    private var upcomingQueue: [String] = []  // próximas de la cola, en orden
-    private var preparing = Set<String>()
-    private var activePrefetches = 0
-    private static let maxPrefetches = 1      // de una en una, para no frenar la canción que pulsas
-    private static let upcomingCount = 15     // no más, para no gastar datos de golpe
     private var artwork: MPMediaItemArtwork?
     private var loadTask: Task<Void, Never>?
     private var timeObserver: Any?
@@ -108,14 +102,12 @@ final class Player: ObservableObject {
         guard current != nil else { play([track]); return }
         queue.insert(track, at: index + 1)
         originalQueue.append(track)
-        prepareUpcoming()
     }
 
     func addToQueue(_ track: Track) {
         guard current != nil else { play([track]); return }
         queue.append(track)
         originalQueue.append(track)
-        prepareUpcoming()
     }
 
     func toggleShuffle() {
@@ -130,7 +122,6 @@ final class Player: ObservableObject {
             queue = originalQueue
             index = originalQueue.firstIndex(of: cur) ?? 0
         }
-        prepareUpcoming()
     }
 
     func cycleRepeat() {
@@ -224,13 +215,12 @@ final class Player: ObservableObject {
                 isLoading = false
                 failuresInARow = 0
                 updateNowPlaying()
-                prepareUpcoming()
+                prepareNext()
                 endBackgroundWork()
             } catch {
                 guard !Task.isCancelled, current?.id == track.id else { return }
                 endBackgroundWork()
                 isLoading = false
-                runPrefetches()
                 errorMessage = "No se pudo reproducir «\(track.title)»"
                 failuresInARow += 1
                 if failuresInARow < 5, index + 1 < queue.count {
@@ -277,61 +267,12 @@ final class Player: ObservableObject {
         return url
     }
 
-    /// Prepara una canción que está en pantalla para que suene al instante al tocarla.
-    /// Se atienden primero las últimas que han aparecido (las que estás viendo ahora).
-    func prepare(_ track: Track) {
-        let id = track.id
-        guard needsPreparing(id), !visibleQueue.contains(id) else { return }
-        visibleQueue.append(id)
-        if visibleQueue.count > 30 { visibleQueue.removeFirst() }
-        runPrefetches()
-    }
-
-    func prefetch(_ tracks: [Track], limit: Int = 3) {
-        for track in tracks.prefix(limit).reversed() { prepare(track) }
-    }
-
-    /// Prepara en orden las próximas canciones de la cola (y la anterior), para que
-    /// siguiente/anterior suenen al momento. Se rellena cada vez que cambia de canción.
-    private func prepareUpcoming() {
-        guard !queue.isEmpty else { return }
-        var ids = queue[(index + 1)...].prefix(Self.upcomingCount).map(\.id)
-        if repeatMode == .all, ids.count < Self.upcomingCount {
-            ids += queue.prefix(min(index, Self.upcomingCount - ids.count)).map(\.id)
-        }
-        if index > 0 { ids.append(queue[index - 1].id) }
-        upcomingQueue = ids.filter { needsPreparing($0) }
-        runPrefetches()
-    }
-
-    private func runPrefetches() {
-        // Mientras carga la canción que has pulsado, no se empieza a preparar ninguna otra
-        while !isLoading, activePrefetches < Self.maxPrefetches, let id = nextToPrepare() {
-            activePrefetches += 1
-            preparing.insert(id)
-            Task {
-                _ = try? await resolve(id)
-                preparing.remove(id)
-                activePrefetches -= 1
-                runPrefetches()
-            }
-        }
-    }
-
-    /// Primero lo que estás viendo en pantalla; después, lo que viene en la cola.
-    private func nextToPrepare() -> String? {
-        while let id = visibleQueue.popLast() {
-            if needsPreparing(id) { return id }
-        }
-        while !upcomingQueue.isEmpty {
-            let id = upcomingQueue.removeFirst()
-            if needsPreparing(id) { return id }
-        }
-        return nil
-    }
-
-    private func needsPreparing(_ id: String) -> Bool {
-        !isCached(id) && inflight[id] == nil && !preparing.contains(id)
+    /// Cuando ya está sonando una canción, prepara solo la siguiente para que no haya silencio entre canciones.
+    private func prepareNext() {
+        guard index + 1 < queue.count else { return }
+        let id = queue[index + 1].id
+        guard !isCached(id), inflight[id] == nil else { return }
+        Task { _ = try? await resolve(id) }
     }
 
     private func isCached(_ id: String) -> Bool {

@@ -75,7 +75,6 @@ struct SearchView: View {
         do {
             results = try await YouTubeService.search(q)
             if results.isEmpty { errorMessage = "Sin resultados" }
-            player.prefetch(results)
         } catch {
             errorMessage = "Error al buscar. Revisa tu conexión."
         }
@@ -88,7 +87,6 @@ struct SearchView: View {
         do {
             let track = try await YouTubeService.track(fromLink: linkText)
             results = [track]
-            player.prefetch(results)
         } catch {
             errorMessage = error.localizedDescription
         }
